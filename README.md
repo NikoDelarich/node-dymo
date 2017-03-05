@@ -37,6 +37,7 @@ node-dymo provides three methods you can call at any time:
 * `online` A Dymo scale was connected and powered on
 * `offline` A Dymo scale was powered off/disconnected
 * `weight-change` Fires when the weight on the scale changes.  Passes an object to the event listener containing a numerical `value` property and either `ounces` or `grams` for the `system` property.
+* `weight-stable` Similiar to `weight-change` but fired only once weight has stabilized
 * `overweight-change` Fires when the weight on the scale exceeds it's maximum capacity.  Passes a `true` or `false` boolean to the event listener depending on whether or not the scale is over or under weight respectively.
 * `weight` Fires when either the weight changes, or when the scale becomes overweight or underweight (combination of both `weight-change` and `overweight-change` events)
 * `end` Fires when the scale errors or is powered off

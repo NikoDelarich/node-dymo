@@ -1,6 +1,7 @@
 var usb = require('usb'),
     events = require('events'),
     async = require('async'),
+    HID = require('node-hid'),
     Scale;
     
 Scale = function() {
@@ -9,90 +10,86 @@ Scale = function() {
 
   events.EventEmitter.call(this);
 
-  this.vendorId = 2338;
+  this.vendorId = 0x922;
   this.weight = {
     value: 0,
     overweight: false,
     system: undefined,
   };
 
-  this.connect = function(productId, device) {
+  this.weightIdentCount = 0;
+
+  this.connect = function(usbDesc) {
     async.waterfall([
       function(callback) {
-        var devicesFound = [],
-            devices,
-            i, ii;
+        var hidDesc = null, hidDevice;
 
-        if (device) {
-          // A device was already provided, no need to scan for it
-          callback(null, device);
+        var devices = HID.devices().filter(function(x) {
+          if(usbDesc) {
+            // Find HID device
+            if( x.vendorId == usbDesc.deviceDescriptor.idVendor &&
+                x.productId == usbDesc.deviceDescriptor.idProduct )
+            {
+              return true;
+            }
+
+            // Open first device if none was provided
+            return false;
+          }
+
+          return x.manufacturer === "DYMO";
+        });
+        if (devices.length > 0) {
+          hidDesc = devices[0];
+        } else {
+          callback('No USB scale detected');
           return;
         }
 
-        if (productId && usb.findByIds(that.vendorId, productId)) {
-          // The productId is a valid one, move along
-          callback(null, usb.findByIds(that.vendorId, productId));
+        hidDevice = new HID.HID(hidDesc.path);
+        if (hidDevice) {
+          callback(null, hidDevice);
         } else {
-          // .connect() wasn't passed a productId, attempt to find it
-          devices = usb.getDeviceList();
-          for (i=0,ii=devices.length;i<ii;i++) {
-            // Scan all USB devices to see if there's a hit
-            if (devices[i].deviceDescriptor.idVendor === that.vendorId) {
-              devicesFound.push(devices[i]);
-            }
-          }
-          if (devicesFound.length > 1) {
-            // For now, we can only have one scale plugged in
-            callback('There is more than one Dymo scale connected.  A productId is required.');
-          } else if (devicesFound.length === 0) {
-            // No scales were found
-            callback('No USB scale detected');
-          } else {
-            // Exactly one valid scale was found.  Good!
-            callback(null, devicesFound[0]);
-          }
+          callback('Could not open USB device');
         }
       },
 
       function(device, callback) {
-        device.open();
-        device.reset(function() {
-          if (device.interface(0).isKernelDriverActive()) {
-            device.interface(0).detachKernelDriver();
-          }
-          device.interface(0).claim();
-          callback(null, device);
-        });
-      },
-
-      function(device, callback) {
-        device.interface(0).endpoint(130).startPoll(3,6);
         status = true;
 
-        device.interface(0).endpoint(130).on('error', function(data) {
+        device.on('error', function(data) {
           status = false;
           that.emit('end');
           callback(data);
         });
 
-        device.interface(0).endpoint(130).on('end', function(data) {
+        device.on('end', function(data) {
           status = false;
           that.emit('end');
-          device.interface(0).endpoint(130).stopPoll();
           callback(data);
         });
 
-        device.interface(0).endpoint(130).on('data', function(data) {
-          var dataArray = data.toJSON(),
+        device.on('data', function(data) {
+          var dataArray = data.toJSON().data,
               change = false,
               value = 0,
               overweight = false,
+              underZero = false,
+              valueOk = false,
               system = 'ounces';
 
           if (dataArray[1] === 2) {
             // no weight is on the scale
+            valueOk = true;
             value = 0;
-            overweight = false;
+            if(that.weightIdentCount < 3) that.weightIdentCount = 3;
+          }
+          if (dataArray[1] === 4) {
+            valueOk = true;
+          }
+          if (dataArray[1] === 5) {
+            valueOk = true;
+            underZero = true;
           }
           if (dataArray[2] == 11) {
             system = 'ounces';
@@ -100,12 +97,10 @@ Scale = function() {
           if (dataArray[2] == 2) {
             system = 'grams';
           }
-          if (dataArray[1] === 4 && system === 'ounces') {
-            overweight = false;
+          if (valueOk && system === 'ounces') {
             value = Math.round(((dataArray[4] + (dataArray[5] * 256)) * 0.1) * 10) / 10;
           }
-          if (dataArray[1] === 4 && system === 'grams') {
-            overweight = false;
+          if (valueOk && system === 'grams') {
             value = Math.round((dataArray[4] + dataArray[5] * 256) * 10) / 10;
           }
           if (dataArray[1] === 6) {
@@ -114,19 +109,30 @@ Scale = function() {
             overweight = true;
           }
 
-          if (that.weight.value !== value) {
+          // Negative value
+          if(underZero) value = -value;
+
+          if (that.weight.overweight !== overweight) {
+            that.weight.overweight = overweight;
+            that.emit('overweight-change', overweight);
+            change = true;
+          }
+          if (valueOk && that.weight.value !== value) {
             that.weight.value = value;
             that.weight.system = system;
             that.emit('weight-change', { value: value, system: system });
             change = true;
           }
-          if (that.weight.overweight !== overweight) { 
-            that.weight.overweight = overweight; 
-            that.emit('overweight-change', overweight);
-            change = true;
-          }
           if (change === true) {
+            that.weightIdentCount = 0;
             that.emit('weight', that.weight);
+          } else if(!that.weight.overweight) {
+            if(that.weightIdentCount < 3) {
+              that.weightIdentCount++;
+            } else if(that.weightIdentCount == 3) {
+              that.weightIdentCount++;
+              that.emit('weight-stable', that.weight);
+            }
           }
         });
       }
@@ -155,7 +161,7 @@ Scale = function() {
   usb.on('attach', function(device) {
     // A new USB device was attached/powered on, check to see if it's a scale
     if (device.deviceDescriptor.idVendor === that.vendorId) {
-      that.connect(null, device);
+      that.connect(device);
       that.emit('online');
     }
   })
